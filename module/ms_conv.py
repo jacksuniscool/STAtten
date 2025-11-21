@@ -72,10 +72,7 @@ class MS_MLP_Conv(nn.Module):
         x = x + identity
         return x, hook
 
-
-# ============================================================================
-# NEW: MoE Implementation
-# ============================================================================
+# MoE Implementation
 
 class MS_MLP_Expert(nn.Module):
     """Single expert network - same structure as MS_MLP_Conv"""
@@ -313,10 +310,8 @@ class MS_MoE_Conv(nn.Module):
         # Compute load balancing loss (before detach, needs gradients)
         self.load_balancing_loss = self.compute_load_balancing_loss(router_logits, top_k_indices)
         
-        # ============================================================================
-        # CORRECTED: Token-level expert processing
+        # Token-level expert processing
         # Each expert processes only tokens assigned to it, in batches
-        # ============================================================================
         
         output = torch.zeros_like(x)
         
@@ -341,7 +336,7 @@ class MS_MoE_Conv(nn.Module):
             # Get weights for this expert's assignments
             expert_weights = top_k_weights[tb_indices, k_indices]  # (num_assignments,)
             
-            # ✅ CRITICAL FIX: Process each token independently
+            # CRITICAL FIX: Process each token independently
             # Gather only the assigned tokens (no temporal grouping)
             num_tokens = len(t_indices)
             
@@ -367,10 +362,7 @@ class MS_MoE_Conv(nn.Module):
         
         return output, hook
 
-
-# ============================================================================
 # Original Classes (unchanged)
-# ============================================================================
 
 class MS_SSA_Conv(nn.Module):
     def __init__(
@@ -587,9 +579,7 @@ class MS_Block_Conv(nn.Module):
         return x, attn, hook
 
 
-# ============================================================================
-# NEW: MoE-enabled Block
-# ============================================================================
+# MoE-enabled Block
 
 class MS_Block_Conv_MoE(nn.Module):
     """Block with optional MoE support"""
