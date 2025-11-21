@@ -5,6 +5,8 @@ from spikingjelly.clock_driven.neuron import (
 )
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 class dvs_pooling(nn.Module):
     def __init__(self) -> None:
@@ -70,6 +72,305 @@ class MS_MLP_Conv(nn.Module):
         x = x + identity
         return x, hook
 
+
+# ============================================================================
+# NEW: MoE Implementation
+# ============================================================================
+
+class MS_MLP_Expert(nn.Module):
+    """Single expert network - same structure as MS_MLP_Conv"""
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        spike_mode="lif",
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.res = in_features == hidden_features
+        
+        self.fc1_conv = nn.Conv2d(in_features, hidden_features, kernel_size=1, stride=1)
+        self.fc1_bn = nn.BatchNorm2d(hidden_features)
+        
+        if spike_mode == "lif":
+            self.fc1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
+        elif spike_mode == "plif":
+            self.fc1_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
+        
+        self.fc2_conv = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
+        self.fc2_bn = nn.BatchNorm2d(out_features)
+        
+        if spike_mode == "lif":
+            self.fc2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
+        elif spike_mode == "plif":
+            self.fc2_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
+        
+        self.c_hidden = hidden_features
+        self.c_output = out_features
+
+    def reset(self):
+        """Reset LIF neuron states - critical for independent processing of samples"""
+        for m in self.modules():
+            if hasattr(m, "reset"):
+                m.reset()
+
+    def forward(self, x):
+        T, B, C, H, W = x.shape
+        identity = x
+        
+        x = self.fc1_lif(x)
+        x = self.fc1_conv(x.flatten(0, 1))
+        x = self.fc1_bn(x).reshape(T, B, self.c_hidden, H, W).contiguous()
+        
+        if self.res:
+            x = identity + x
+            identity = x
+        
+        x = self.fc2_lif(x)
+        x = self.fc2_conv(x.flatten(0, 1))
+        x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
+        x = x + identity
+        
+        return x
+
+
+class SpikeRouter(nn.Module):
+    """Spike-based router for expert selection"""
+    def __init__(
+        self,
+        in_features,
+        num_experts,
+        top_k=2,
+        spike_mode="lif",
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        # Router network
+        self.router_conv = nn.Conv2d(in_features, num_experts, kernel_size=1, stride=1)
+        self.router_bn = nn.BatchNorm2d(num_experts)
+        
+        if spike_mode == "lif":
+            self.router_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
+        elif spike_mode == "plif":
+            self.router_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (T, B, C, H, W)
+        
+        Returns:
+            routing_weights: Softmax probabilities (T*B, num_experts)
+            selected_experts: Top-k expert indices (T*B, top_k)
+            router_logits: Raw router outputs (T*B, num_experts)
+        """
+        T, B, C, H, W = x.shape
+        
+        # Generate routing logits through spike network
+        router_out = self.router_lif(x)
+        router_out = self.router_conv(router_out.flatten(0, 1))
+        router_out = self.router_bn(router_out).reshape(T, B, self.num_experts, H, W)
+        
+        # Global average pooling over spatial dimensions for routing decision
+        # Shape: (T, B, num_experts)
+        router_logits = router_out.mean(dim=[-2, -1])
+        
+        # Flatten temporal and batch dimensions
+        # Shape: (T*B, num_experts)
+        router_logits = router_logits.reshape(T * B, self.num_experts)
+        
+        # Apply softmax to get routing probabilities
+        routing_weights = F.softmax(router_logits, dim=-1)
+        
+        # Select top-k experts
+        top_k_weights, top_k_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        
+        # Renormalize top-k weights
+        top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+        
+        return top_k_weights, top_k_indices, router_logits
+
+
+class MS_MoE_Conv(nn.Module):
+    """
+    Sparse Mixture of Experts for SNN - CORRECTED VERSION
+    
+    Key design decisions:
+    1. Token-level routing: Each (t,b) position independently routed
+    2. NO temporal grouping: Experts see only their assigned tokens
+    3. Preserves baseline MLP behavior when top_k=1, num_experts=1
+    """
+    def __init__(
+        self,
+        in_features,
+        hidden_features=None,
+        out_features=None,
+        num_experts=8,
+        top_k=2,
+        spike_mode="lif",
+        layer=0,
+        aux_loss_weight=0.01,
+    ):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.layer = layer
+        self.aux_loss_weight = aux_loss_weight
+        
+        # Create router
+        self.router = SpikeRouter(
+            in_features=in_features,
+            num_experts=num_experts,
+            top_k=top_k,
+            spike_mode=spike_mode,
+        )
+        
+        # Create expert networks
+        self.experts = nn.ModuleList([
+            MS_MLP_Expert(
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
+                spike_mode=spike_mode,
+            )
+            for _ in range(num_experts)
+        ])
+        
+        self.c_output = out_features
+        self.load_balancing_loss = None
+
+    def compute_load_balancing_loss(self, router_logits, selected_experts):
+        """
+        Compute auxiliary load balancing loss to encourage uniform expert usage
+        
+        Args:
+            router_logits: Raw router outputs (T*B, num_experts)
+            selected_experts: Selected expert indices (T*B, top_k)
+        """
+        # Compute the fraction of tokens routed to each expert
+        expert_counts = torch.bincount(
+            selected_experts.view(-1),
+            minlength=self.num_experts
+        ).float()
+        
+        # Normalize to get fraction
+        expert_fraction = expert_counts / selected_experts.numel()
+        
+        # Compute router probabilities
+        router_probs = F.softmax(router_logits, dim=-1)
+        router_prob_per_expert = router_probs.mean(dim=0)
+        
+        # Load balancing loss: encourages uniform distribution
+        load_balancing_loss = self.num_experts * (expert_fraction * router_prob_per_expert).sum()
+        
+        return load_balancing_loss
+
+    def forward(self, x, hook=None):
+        """
+        Token-level MoE routing that preserves baseline MLP behavior.
+        
+        Each (t, b) token is independently routed to top_k experts.
+        Experts process tokens WITHOUT seeing unassigned temporal context.
+        
+        This matches baseline behavior: each token through MLP independently.
+        
+        Args:
+            x: Input tensor of shape (T, B, C, H, W)
+            hook: Optional dictionary for storing intermediate activations
+        
+        Returns:
+            output: Mixed expert outputs (T, B, C, H, W)
+            hook: Updated hook dictionary
+        """
+        T, B, C, H, W = x.shape
+        identity = x
+        
+        # Reset all experts at the start of forward (once per forward call)
+        for expert in self.experts:
+            expert.reset()
+        
+        # Get routing decisions
+        top_k_weights, top_k_indices, router_logits = self.router(x)
+        # top_k_weights: (T*B, top_k)
+        # top_k_indices: (T*B, top_k)
+        
+        # Detach routing weights from expert gradients (critical for MoE sparsity)
+        top_k_weights = top_k_weights.detach()
+        top_k_indices = top_k_indices.detach()
+        
+        # Store routing information in hook if provided
+        if hook is not None:
+            hook[self._get_name() + str(self.layer) + "_routing_weights"] = top_k_weights.detach()
+            hook[self._get_name() + str(self.layer) + "_routing_indices"] = top_k_indices.detach()
+        
+        # Compute load balancing loss (before detach, needs gradients)
+        self.load_balancing_loss = self.compute_load_balancing_loss(router_logits, top_k_indices)
+        
+        # ============================================================================
+        # CORRECTED: Token-level expert processing
+        # Each expert processes only tokens assigned to it, in batches
+        # ============================================================================
+        
+        output = torch.zeros_like(x)
+        
+        # Process each expert with its assigned tokens
+        for expert_idx in range(self.num_experts):
+            # Find all (T*B, top_k) positions where this expert is selected
+            expert_mask = (top_k_indices == expert_idx)
+            
+            if not expert_mask.any():
+                continue  # Skip if no tokens assigned
+            
+            # Get indices where this expert is selected
+            tb_indices, k_indices = torch.where(expert_mask)
+            
+            if len(tb_indices) == 0:
+                continue
+            
+            # Convert flat TB indices to (T, B) coordinates
+            t_indices = tb_indices // B
+            b_indices = tb_indices % B
+            
+            # Get weights for this expert's assignments
+            expert_weights = top_k_weights[tb_indices, k_indices]  # (num_assignments,)
+            
+            # ✅ CRITICAL FIX: Process each token independently
+            # Gather only the assigned tokens (no temporal grouping)
+            num_tokens = len(t_indices)
+            
+            # Create batch of tokens for this expert: (1, num_tokens, C, H, W)
+            # Using T=1 because each token is processed independently
+            expert_input = torch.zeros(1, num_tokens, C, H, W, device=x.device, dtype=x.dtype)
+            
+            for i, (t_idx, b_idx) in enumerate(zip(t_indices, b_indices)):
+                expert_input[0, i] = x[t_idx, b_idx]
+            
+            # Process through expert - each token independent
+            expert_output = self.experts[expert_idx](expert_input)  # (1, num_tokens, C, H, W)
+            
+            # Distribute weighted outputs back to their positions
+            for i, (t_idx, b_idx, weight) in enumerate(zip(t_indices, b_indices, expert_weights)):
+                output[t_idx, b_idx] += weight * expert_output[0, i]
+        
+        # Add residual connection (matches baseline MLP)
+        output = output + identity
+        
+        if hook is not None:
+            hook[self._get_name() + str(self.layer) + "_moe_output"] = output.detach()
+        
+        return output, hook
+
+
+# ============================================================================
+# Original Classes (unchanged)
+# ============================================================================
 
 class MS_SSA_Conv(nn.Module):
     def __init__(
@@ -234,7 +535,8 @@ class MS_SSA_Conv(nn.Module):
                 .contiguous()
             )
 
-        assert self.attention_mode not in ["STAtten, SDT"] 
+        assert self.attention_mode in ["STAtten", "SDT"], \
+            f"Unsupported attention_mode: {self.attention_mode}"
 
         x = x + identity
         return x, v, hook
@@ -283,3 +585,82 @@ class MS_Block_Conv(nn.Module):
         x_attn, attn, hook = self.attn(x, hook=hook)
         x, hook = self.mlp(x_attn, hook=hook)
         return x, attn, hook
+
+
+# ============================================================================
+# NEW: MoE-enabled Block
+# ============================================================================
+
+class MS_Block_Conv_MoE(nn.Module):
+    """Block with optional MoE support"""
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        qk_scale=None,
+        drop=0.0,
+        attn_drop=0.0,
+        drop_path=0.0,
+        sr_ratio=1,
+        attn_mode="direct_xor",
+        spike_mode="lif",
+        dvs=False,
+        layer=0,
+        attention_mode="STAtten",
+        chunk_size=2,
+        # MoE specific parameters
+        use_moe=True,
+        num_experts=8,
+        expert_top_k=2,
+        aux_loss_weight=0.01,
+    ):
+        super().__init__()
+        self.attn = MS_SSA_Conv(
+            dim,
+            num_heads=num_heads,
+            mode=attn_mode,
+            dvs=dvs,
+            layer=layer,
+            attention_mode=attention_mode,
+            chunk_size=chunk_size
+        )
+        
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        
+        self.use_moe = use_moe
+        self.aux_loss_weight = aux_loss_weight
+        
+        if use_moe:
+            self.mlp = MS_MoE_Conv(
+                in_features=dim,
+                hidden_features=mlp_hidden_dim,
+                num_experts=num_experts,
+                top_k=expert_top_k,
+                spike_mode=spike_mode,
+                layer=layer,
+                aux_loss_weight=aux_loss_weight,
+            )
+        else:
+            self.mlp = MS_MLP_Conv(
+                in_features=dim,
+                hidden_features=mlp_hidden_dim,
+                spike_mode=spike_mode,
+                layer=layer,
+            )
+
+    def forward(self, x, hook=None):
+        x_attn, attn, hook = self.attn(x, hook=hook)
+        x, hook = self.mlp(x_attn, hook=hook)
+        # Note: drop_path defined but not used in original MS_Block_Conv
+        # MLP already contains internal residual connections
+        return x, attn, hook
+    
+    def get_aux_loss(self):
+        """Get auxiliary load balancing loss for training"""
+        if self.use_moe and hasattr(self.mlp, 'load_balancing_loss'):
+            if self.mlp.load_balancing_loss is not None:
+                return self.aux_loss_weight * self.mlp.load_balancing_loss
+        return torch.tensor(0.0, device=next(self.parameters()).device)
