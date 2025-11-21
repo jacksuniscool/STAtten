@@ -110,6 +110,12 @@ class MS_MLP_Expert(nn.Module):
         self.c_hidden = hidden_features
         self.c_output = out_features
 
+    def reset(self):
+        """Reset LIF neuron states - critical for independent processing of samples"""
+        for m in self.modules():
+            if hasattr(m, "reset"):
+                m.reset()
+
     def forward(self, x):
         T, B, C, H, W = x.shape
         identity = x
@@ -242,10 +248,11 @@ class MS_MoE_Conv(nn.Module):
             selected_experts: Selected expert indices (T*B, top_k)
         """
         # Compute the fraction of tokens routed to each expert
-        # Shape: (num_experts,)
-        expert_counts = torch.zeros(self.num_experts, device=router_logits.device)
-        for i in range(self.num_experts):
-            expert_counts[i] = (selected_experts == i).float().sum()
+        # More efficient using bincount
+        expert_counts = torch.bincount(
+            selected_experts.view(-1),
+            minlength=self.num_experts
+        ).float()
         
         # Normalize to get fraction
         expert_fraction = expert_counts / selected_experts.numel()
@@ -299,6 +306,10 @@ class MS_MoE_Conv(nn.Module):
             for k in range(self.top_k):
                 expert_idx = top_k_indices[i, k].item()
                 expert_weight = top_k_weights[i, k]
+                
+                # 🔴 CRITICAL: Reset expert state for each sample
+                # This ensures independent processing without state leakage
+                self.experts[expert_idx].reset()
                 
                 # Forward through selected expert
                 expert_out = self.experts[expert_idx](sample)  # (1, 1, C, H, W)
@@ -484,7 +495,8 @@ class MS_SSA_Conv(nn.Module):
                 .contiguous()
             )
 
-        assert self.attention_mode not in ["STAtten, SDT"] 
+        assert self.attention_mode in ["STAtten", "SDT"], \
+            f"Unsupported attention_mode: {self.attention_mode}"
 
         x = x + identity
         return x, v, hook
