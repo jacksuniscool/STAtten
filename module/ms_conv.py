@@ -196,7 +196,14 @@ class SpikeRouter(nn.Module):
 
 
 class MS_MoE_Conv(nn.Module):
-    """Sparse Mixture of Experts for SNN"""
+    """
+    Sparse Mixture of Experts for SNN - CORRECTED VERSION
+    
+    Key design decisions:
+    1. Token-level routing: Each (t,b) position independently routed
+    2. NO temporal grouping: Experts see only their assigned tokens
+    3. Preserves baseline MLP behavior when top_k=1, num_experts=1
+    """
     def __init__(
         self,
         in_features,
@@ -248,7 +255,6 @@ class MS_MoE_Conv(nn.Module):
             selected_experts: Selected expert indices (T*B, top_k)
         """
         # Compute the fraction of tokens routed to each expert
-        # More efficient using bincount
         expert_counts = torch.bincount(
             selected_experts.view(-1),
             minlength=self.num_experts
@@ -262,13 +268,19 @@ class MS_MoE_Conv(nn.Module):
         router_prob_per_expert = router_probs.mean(dim=0)
         
         # Load balancing loss: encourages uniform distribution
-        # This is the standard MoE auxiliary loss
         load_balancing_loss = self.num_experts * (expert_fraction * router_prob_per_expert).sum()
         
         return load_balancing_loss
 
     def forward(self, x, hook=None):
         """
+        Token-level MoE routing that preserves baseline MLP behavior.
+        
+        Each (t, b) token is independently routed to top_k experts.
+        Experts process tokens WITHOUT seeing unassigned temporal context.
+        
+        This matches baseline behavior: each token through MLP independently.
+        
         Args:
             x: Input tensor of shape (T, B, C, H, W)
             hook: Optional dictionary for storing intermediate activations
@@ -280,46 +292,74 @@ class MS_MoE_Conv(nn.Module):
         T, B, C, H, W = x.shape
         identity = x
         
+        # Reset all experts at the start of forward (once per forward call)
+        for expert in self.experts:
+            expert.reset()
+        
         # Get routing decisions
         top_k_weights, top_k_indices, router_logits = self.router(x)
         # top_k_weights: (T*B, top_k)
         # top_k_indices: (T*B, top_k)
+        
+        # Detach routing weights from expert gradients (critical for MoE sparsity)
+        top_k_weights = top_k_weights.detach()
+        top_k_indices = top_k_indices.detach()
         
         # Store routing information in hook if provided
         if hook is not None:
             hook[self._get_name() + str(self.layer) + "_routing_weights"] = top_k_weights.detach()
             hook[self._get_name() + str(self.layer) + "_routing_indices"] = top_k_indices.detach()
         
-        # Compute load balancing loss
+        # Compute load balancing loss (before detach, needs gradients)
         self.load_balancing_loss = self.compute_load_balancing_loss(router_logits, top_k_indices)
         
-        # Process each batch-time sample through selected experts
+        # ============================================================================
+        # CORRECTED: Token-level expert processing
+        # Each expert processes only tokens assigned to it, in batches
+        # ============================================================================
+        
         output = torch.zeros_like(x)
         
-        # Process through experts
-        for i in range(T * B):
-            t_idx = i // B
-            b_idx = i % B
-            sample = x[t_idx:t_idx+1, b_idx:b_idx+1]  # (1, 1, C, H, W)
+        # Process each expert with its assigned tokens
+        for expert_idx in range(self.num_experts):
+            # Find all (T*B, top_k) positions where this expert is selected
+            expert_mask = (top_k_indices == expert_idx)
             
-            expert_outputs = []
-            for k in range(self.top_k):
-                expert_idx = top_k_indices[i, k].item()
-                expert_weight = top_k_weights[i, k]
-                
-                # 🔴 CRITICAL: Reset expert state for each sample
-                # This ensures independent processing without state leakage
-                self.experts[expert_idx].reset()
-                
-                # Forward through selected expert
-                expert_out = self.experts[expert_idx](sample)  # (1, 1, C, H, W)
-                expert_outputs.append(expert_weight * expert_out)
+            if not expert_mask.any():
+                continue  # Skip if no tokens assigned
             
-            # Combine expert outputs
-            combined = sum(expert_outputs)
-            output[t_idx, b_idx] = combined.squeeze(0).squeeze(0)
+            # Get indices where this expert is selected
+            tb_indices, k_indices = torch.where(expert_mask)
+            
+            if len(tb_indices) == 0:
+                continue
+            
+            # Convert flat TB indices to (T, B) coordinates
+            t_indices = tb_indices // B
+            b_indices = tb_indices % B
+            
+            # Get weights for this expert's assignments
+            expert_weights = top_k_weights[tb_indices, k_indices]  # (num_assignments,)
+            
+            # ✅ CRITICAL FIX: Process each token independently
+            # Gather only the assigned tokens (no temporal grouping)
+            num_tokens = len(t_indices)
+            
+            # Create batch of tokens for this expert: (1, num_tokens, C, H, W)
+            # Using T=1 because each token is processed independently
+            expert_input = torch.zeros(1, num_tokens, C, H, W, device=x.device, dtype=x.dtype)
+            
+            for i, (t_idx, b_idx) in enumerate(zip(t_indices, b_indices)):
+                expert_input[0, i] = x[t_idx, b_idx]
+            
+            # Process through expert - each token independent
+            expert_output = self.experts[expert_idx](expert_input)  # (1, num_tokens, C, H, W)
+            
+            # Distribute weighted outputs back to their positions
+            for i, (t_idx, b_idx, weight) in enumerate(zip(t_indices, b_indices, expert_weights)):
+                output[t_idx, b_idx] += weight * expert_output[0, i]
         
-        # Add residual connection
+        # Add residual connection (matches baseline MLP)
         output = output + identity
         
         if hook is not None:
@@ -614,6 +654,8 @@ class MS_Block_Conv_MoE(nn.Module):
     def forward(self, x, hook=None):
         x_attn, attn, hook = self.attn(x, hook=hook)
         x, hook = self.mlp(x_attn, hook=hook)
+        # Note: drop_path defined but not used in original MS_Block_Conv
+        # MLP already contains internal residual connections
         return x, attn, hook
     
     def get_aux_loss(self):
