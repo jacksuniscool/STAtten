@@ -211,7 +211,7 @@ class MS_AutoMoE(nn.Module):
         return self.token_moe.get_expert_tau_stats()
 
 
-class MS_Block_Conv(nn.Module):
+class MS_Block_Conv_AutoMoE(nn.Module):
     """
     Transformer block with AutoMoE that automatically adapts to data type.
     
@@ -425,7 +425,7 @@ self.mlp = MS_MoE_Conv(...)  # Always token-level
 self.mlp = MS_AutoMoE(...)   # Adapts to your data!
 
 Or use the complete block:
-MS_Block_Conv(
+MS_Block_Conv_AutoMoE(
     dim=256,
     num_heads=8,
     use_moe=True,
@@ -452,3 +452,4 @@ Now the SAME architecture works optimally on:
     print("✓ Easy ablation studies (force_mode parameter)")
     print("✓ Clear logging of which mode was used")
     print("=" * 80)
+MS_Block_Conv = MS_Block_Conv_AutoMoE
