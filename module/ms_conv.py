@@ -334,8 +334,14 @@ class MS_MLP_Expert(nn.Module):
         self.c_output = out_features
 
     def reset(self):
-        """Reset LIF neuron states"""
-        for m in self.modules():
+        """
+        Reset LIF neuron states - critical for independent processing of samples
+        
+        IMPORTANT: Use children() not modules() to avoid infinite recursion!
+        - self.modules() includes self, causing reset() to call itself
+        - self.children() only includes immediate child modules
+        """
+        for m in self.children():
             if hasattr(m, "reset"):
                 m.reset()
 
