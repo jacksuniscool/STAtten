@@ -211,7 +211,7 @@ class MS_AutoMoE(nn.Module):
         return self.token_moe.get_expert_tau_stats()
 
 
-class MS_Block_Conv_AutoMoE(nn.Module):
+class MS_Block_Conv(nn.Module):
     """
     Transformer block with AutoMoE that automatically adapts to data type.
     
@@ -425,7 +425,7 @@ self.mlp = MS_MoE_Conv(...)  # Always token-level
 self.mlp = MS_AutoMoE(...)   # Adapts to your data!
 
 Or use the complete block:
-MS_Block_Conv_AutoMoE(
+MS_Block_Conv(
     dim=256,
     num_heads=8,
     use_moe=True,
