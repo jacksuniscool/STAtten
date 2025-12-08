@@ -1,16 +1,3 @@
-"""
-Temporal MoE for Spiking Neural Networks - MINIMAL CLEAN VERSION
-
-Only includes:
-- MS_SSA_Conv (Attention)
-- MS_MoE_Conv_Temporal (Temporal MoE)
-- MS_Block_Conv_MoE (Complete block)
-- Supporting classes (Expert, Router, Pooling)
-
-Removed:
-- MS_MLP_Conv (replaced by MoE)
-- MS_Block_Conv (replaced by MS_Block_Conv_MoE)
-"""
 
 from timm.models.layers import DropPath
 from spikingjelly.clock_driven.neuron import (
@@ -44,11 +31,17 @@ class dvs_pooling(nn.Module):
 
 class MS_MLP_Expert(nn.Module):
     """
+    ✅ FIXED: Expert as pure function F(x) WITHOUT internal residual
+    
     Expert network with configurable tau for temporal specialization
     
     Architecture: 2-layer MLP with spike neurons
     - Fast experts (low τ): Capture transients, quick responses
     - Slow experts (high τ): Integrate sustained patterns
+    
+    CRITICAL: No internal residual connection!
+    - Residual is handled by MS_MoE_Conv_Temporal: output = x + MoE(x)
+    - Expert just computes F(x), not F(x) + x
     """
     def __init__(
         self,
@@ -61,7 +54,6 @@ class MS_MLP_Expert(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.res = in_features == hidden_features
         self.tau = tau
         
         # Layer 1
@@ -93,31 +85,27 @@ class MS_MLP_Expert(nn.Module):
 
     def forward(self, x):
         """
+        ✅ FIXED: Returns F(x), NOT F(x) + x
+        
         Args:
             x: (T, B, C, H, W) - full temporal sequence
         Returns:
-            output: (T, B, C, H, W) - processed with tau-specific dynamics
+            output: (T, B, C, H, W) - transformed features (NO residual added)
         """
         T, B, C, H, W = x.shape
-        identity = x
         
-        # Layer 1: Conv → BN → LIF
+        # Layer 1: LIF → Conv → BN5
         x = self.fc1_lif(x)
         x = self.fc1_conv(x.flatten(0, 1))
         x = self.fc1_bn(x).reshape(T, B, self.c_hidden, H, W).contiguous()
         
-        if self.res:
-            x = identity + x
-            identity = x
-        
-        # Layer 2: Conv → BN → LIF
+        # Layer 2: LIF → Conv → BN
         x = self.fc2_lif(x)
         x = self.fc2_conv(x.flatten(0, 1))
         x = self.fc2_bn(x).reshape(T, B, self.c_output, H, W).contiguous()
         
-        # Residual connection
-        x = x + identity
-        
+        # ✅ CRITICAL FIX: NO residual connection here!
+        # Residual is handled at MoE level, not expert level
         return x
 
 
@@ -177,16 +165,18 @@ class TemporalRouter(nn.Module):
 
 class MS_MoE_Conv_Temporal(nn.Module):
     """
+    ✅ FIXED: Proper residual connection at MoE level
+    
     Batch-level Temporal MoE with variable tau specialization
+    
+    Residual structure:
+        output = x + sum(weight_i * Expert_i(x))
     
     Features:
     - Fully vectorized (NO Python loops)
     - Anti-collapse regularization (entropy + load balancing)
     - Temporal specialization via different tau values
-    
-    Perfect for tactile sensors:
-    - Fast τ experts capture tap onsets
-    - Slow τ experts integrate sustained pressure
+    - Proper single-level residual connection
     """
     def __init__(
         self,
@@ -242,7 +232,7 @@ class MS_MoE_Conv_Temporal(nn.Module):
             top_k=top_k,
         )
         
-        # Experts with different tau values
+        # Experts with different tau values (NO internal residual)
         self.experts = nn.ModuleList([
             MS_MLP_Expert(
                 in_features=in_features,
@@ -284,18 +274,21 @@ class MS_MoE_Conv_Temporal(nn.Module):
 
     def forward(self, x, hook=None):
         """
-        Fully vectorized forward pass
+        ✅ FIXED: Single residual connection at MoE level
+        
+        Structure: output = x + MoE(x)
+        Where MoE(x) = sum(weight_i * Expert_i(x))
         
         Args:
             x: (T, B, C, H, W) - input features
             hook: Optional dict for debugging/monitoring
         
         Returns:
-            output: (T, B, C, H, W) - mixed expert outputs
+            output: (T, B, C, H, W) - x + mixed expert outputs
             hook: Updated hook dict
         """
         T, B, C, H, W = x.shape
-        identity = x
+        identity = x  # ✅ Save for single residual connection
         
         # Reset all experts
         for expert in self.experts:
@@ -318,7 +311,8 @@ class MS_MoE_Conv_Temporal(nn.Module):
             hook[self._get_name() + str(self.layer) + "_routing_indices"] = top_k_indices.clone()
             hook[self._get_name() + str(self.layer) + "_selected_taus"] = self.expert_taus[top_k_indices].clone()
         
-        output = torch.zeros_like(x)
+        # ✅ Initialize as zeros (will accumulate expert outputs)
+        moe_output = torch.zeros_like(x)
         
         # ✅ VECTORIZED: Process each expert
         for expert_idx in range(self.num_experts):
@@ -338,7 +332,7 @@ class MS_MoE_Conv_Temporal(nn.Module):
             # Extract assigned samples (full temporal sequences)
             expert_input = x[:, b_indices, :, :, :]
             
-            # Process through expert
+            # ✅ Process through expert (returns F(x), not F(x) + x)
             expert_output = self.experts[expert_idx](expert_input)
             
             # Apply weights (vectorized)
@@ -346,10 +340,11 @@ class MS_MoE_Conv_Temporal(nn.Module):
             weighted_output = expert_output * expert_weights_reshaped
             
             # ✅ CRITICAL: Fully vectorized scatter-add
-            output.index_add_(dim=1, index=b_indices, source=weighted_output)
+            moe_output.index_add_(dim=1, index=b_indices, source=weighted_output)
         
-        # Residual connection
-        output = output + identity
+        # ✅ CRITICAL FIX: Single residual connection at MoE level
+        # output = x + MoE(x), NOT x + (MoE(x) + x)
+        output = identity + moe_output
         
         if hook is not None:
             hook[self._get_name() + str(self.layer) + "_moe_output"] = output.detach()
@@ -370,25 +365,21 @@ class MS_MoE_Conv_Temporal(nn.Module):
 
 
 # ============================================================================
-# ATTENTION MODULE
+# ATTENTION MODULE - STAtten ONLY
 # ============================================================================
 
 class MS_SSA_Conv(nn.Module):
     """
-    Spike Self-Attention (Pooling or SDT mode)
+    Spike Self-Attention with STAtten (Spatio-Temporal Attention) ONLY
     
-    Supports:
-    - STAtten: Spatio-Temporal Attention
-    - SDT: Spike-Driven Transformer
+    Note: This module includes internal residual connection (original design)
     """
     def __init__(
         self,
         dim,
         num_heads=8,
-        mode="direct_xor",
         dvs=False,
         layer=0,
-        attention_mode="SDT",  # Changed default to SDT (faster)
         chunk_size=2,
         spike_mode="lif"
     ):
@@ -400,8 +391,8 @@ class MS_SSA_Conv(nn.Module):
         self.dim = dim
         self.dvs = dvs
         self.num_heads = num_heads
-        self.attention_mode = attention_mode
         self.chunk_size = chunk_size
+        self.layer = layer
         
         if dvs:
             self.pool = dvs_pooling()
@@ -423,22 +414,27 @@ class MS_SSA_Conv(nn.Module):
 
         self.attn_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend="cupy")
 
-        # For SDT mode
-        self.talking_heads = nn.Conv1d(num_heads, num_heads, kernel_size=1, stride=1, bias=False)
-        self.talking_heads_lif = MultiStepLIFNode(tau=2.0, v_threshold=0.5, detach_reset=True, backend="cupy")
-
         # Output projection
         self.proj_conv = nn.Conv2d(dim, dim, kernel_size=1, stride=1)
         self.proj_bn = nn.BatchNorm2d(dim)
         self.shortcut_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
 
-        self.mode = mode
-        self.layer = layer
-
     def forward(self, x, hook=None):
+        """
+        STAtten forward pass with internal residual
+        
+        Args:
+            x: (T, B, C, H, W) - input spikes
+            hook: Optional monitoring dict
+        
+        Returns:
+            x: (T, B, C, H, W) - attention output (with residual)
+            v: V features (for visualization)
+            hook: Updated monitoring dict
+        """
         T, B, C, H, W = x.shape
         head_dim = C // self.num_heads
-        identity = x
+        identity = x  # Internal residual
         N = H * W
         
         x = self.shortcut_lif(x)
@@ -450,7 +446,7 @@ class MS_SSA_Conv(nn.Module):
 
         x_for_qkv = x.flatten(0, 1)
 
-        # Q, K, V projections
+        # Q projection
         q_conv_out = self.q_conv(x_for_qkv)
         q_conv_out = self.q_bn(q_conv_out).reshape(T, B, C, H, W).contiguous()
         q_conv_out = self.q_lif(q_conv_out)
@@ -462,6 +458,7 @@ class MS_SSA_Conv(nn.Module):
              .reshape(T, B, N, self.num_heads, C // self.num_heads)
              .permute(0, 1, 3, 2, 4).contiguous())
 
+        # K projection
         k_conv_out = self.k_conv(x_for_qkv)
         k_conv_out = self.k_bn(k_conv_out).reshape(T, B, C, H, W).contiguous()
         k_conv_out = self.k_lif(k_conv_out)
@@ -473,6 +470,7 @@ class MS_SSA_Conv(nn.Module):
              .reshape(T, B, N, self.num_heads, C // self.num_heads)
              .permute(0, 1, 3, 2, 4).contiguous())
 
+        # V projection
         v_conv_out = self.v_conv(x_for_qkv)
         v_conv_out = self.v_bn(v_conv_out).reshape(T, B, C, H, W).contiguous()
         v_conv_out = self.v_lif(v_conv_out)
@@ -484,101 +482,76 @@ class MS_SSA_Conv(nn.Module):
              .reshape(T, B, N, self.num_heads, C // self.num_heads)
              .permute(0, 1, 3, 2, 4).contiguous())
 
-        # Attention computation
-        if self.attention_mode == "STAtten":
-            if self.dvs:
-                scaling_factor = 1 / (H*H*self.chunk_size)
-            else:
-                scaling_factor = 1 / H
-
-            num_chunks = T // self.chunk_size
-            q_chunks = q.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
-            k_chunks = k.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
-            v_chunks = v.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
-
-            q_chunks = q_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
-            k_chunks = k_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
-            v_chunks = v_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
-
-            attn = torch.matmul(k_chunks.transpose(-2, -1), v_chunks) * scaling_factor
-            out = torch.matmul(q_chunks, attn)
-
-            out = out.reshape(num_chunks, B, self.num_heads, self.chunk_size, N, head_dim).permute(0, 3, 1, 2, 4, 5)
-            output = out.reshape(T, B, self.num_heads, N, head_dim)
-
-            x = output.transpose(4,3).reshape(T, B, C, N).contiguous()
-            x = self.attn_lif(x).reshape(T, B, C, H, W)
-            
-            if self.dvs:
-                x = x.mul(x_pool)
-                x = x + x_pool
-
-            if hook is not None:
-                hook[self._get_name() + str(self.layer) + "_after_qkv"] = x
-
-            x = (
-                self.proj_bn(self.proj_conv(x.flatten(0, 1)))
-                .reshape(T, B, C, H, W)
-                .contiguous()
-            )
-
-        elif self.attention_mode == "SDT":
-            kv = k.mul(v)
-            if hook is not None:
-                hook[self._get_name() + str(self.layer) + "_kv_before"] = kv
-            if self.dvs:
-                kv = self.pool(kv)
-            kv = kv.sum(dim=-2, keepdim=True)
-            kv = self.talking_heads_lif(kv)
-            if hook is not None:
-                hook[self._get_name() + str(self.layer) + "_kv"] = kv.detach()
-            x = q.mul(kv)
-            if self.dvs:
-                x = self.pool(x)
-            if hook is not None:
-                hook[self._get_name() + str(self.layer) + "_x_after_qkv"] = x.detach()
-
-            x = x.transpose(3, 4).reshape(T, B, C, H, W).contiguous()
-            x = (
-                self.proj_bn(self.proj_conv(x.flatten(0, 1)))
-                .reshape(T, B, C, H, W)
-                .contiguous()
-            )
+        # STAtten computation
+        if self.dvs:
+            scaling_factor = 1 / (H * H * self.chunk_size)
         else:
-            raise ValueError(f"Unsupported attention_mode: {self.attention_mode}")
+            scaling_factor = 1 / H
 
-        # Residual connection
+        num_chunks = T // self.chunk_size
+        
+        # Reshape for chunked processing
+        q_chunks = q.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
+        k_chunks = k.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
+        v_chunks = v.view(num_chunks, self.chunk_size, B, self.num_heads, N, head_dim).permute(0, 2, 3, 1, 4, 5)
+
+        # Merge chunk_size and N dimensions
+        q_chunks = q_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
+        k_chunks = k_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
+        v_chunks = v_chunks.reshape(num_chunks, B, self.num_heads, self.chunk_size * N, head_dim)
+
+        # Compute attention
+        attn = torch.matmul(k_chunks.transpose(-2, -1), v_chunks) * scaling_factor
+        out = torch.matmul(q_chunks, attn)
+
+        # Reshape back
+        out = out.reshape(num_chunks, B, self.num_heads, self.chunk_size, N, head_dim).permute(0, 3, 1, 2, 4, 5)
+        output = out.reshape(T, B, self.num_heads, N, head_dim)
+
+        x = output.transpose(4, 3).reshape(T, B, C, N).contiguous()
+        x = self.attn_lif(x).reshape(T, B, C, H, W)
+        
+        if self.dvs:
+            x = x.mul(x_pool)
+            x = x + x_pool
+
+        if hook is not None:
+            hook[self._get_name() + str(self.layer) + "_after_qkv"] = x
+
+        x = (
+            self.proj_bn(self.proj_conv(x.flatten(0, 1)))
+            .reshape(T, B, C, H, W)
+            .contiguous()
+        )
+
+        # Internal residual connection (original design)
         x = x + identity
         return x, v, hook
 
 
 # ============================================================================
-# COMPLETE BLOCK: ATTENTION + MOE
+# COMPLETE BLOCK: ATTENTION + MOE (Proper Residuals)
 # ============================================================================
 
 class MS_Block_Conv_MoE(nn.Module):
     """
-    Complete SNN block: Spike Attention + Temporal MoE
+    ✅ FIXED: Complete SNN block with proper residual connections
     
-    This is your main building block for the network.
-    Replaces the traditional Attention + MLP with Attention + MoE.
+    Structure:
+        x_attn = x + Attention(x)     [internal residual in MS_SSA_Conv]
+        x_out = x_attn + MoE(x_attn)  [residual in MS_MoE_Conv_Temporal]
+    
+    No double residuals!
     """
     def __init__(
         self,
         dim,
         num_heads,
         mlp_ratio=4.0,
-        qkv_bias=False,
-        qk_scale=None,
-        drop=0.0,
-        attn_drop=0.0,
         drop_path=0.0,
-        sr_ratio=1,
-        attn_mode="direct_xor",
         spike_mode="lif",
         dvs=False,
         layer=0,
-        attention_mode="SDT",
         chunk_size=2,
         # MoE parameters
         num_experts=8,
@@ -594,22 +567,20 @@ class MS_Block_Conv_MoE(nn.Module):
     ):
         super().__init__()
         
-        # Attention
+        # STAtten Attention (has internal residual)
         self.attn = MS_SSA_Conv(
             dim,
             num_heads=num_heads,
-            mode=attn_mode,
             dvs=dvs,
             layer=layer,
-            attention_mode=attention_mode,
             chunk_size=chunk_size,
             spike_mode=spike_mode,
         )
         
-        # DropPath (note: current architecture has internal residuals)
+        # DropPath
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         
-        # MoE (replaces traditional MLP)
+        # MoE (has residual connection, experts are pure functions)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = MS_MoE_Conv_Temporal(
             in_features=dim,
@@ -629,6 +600,8 @@ class MS_Block_Conv_MoE(nn.Module):
 
     def forward(self, x, hook=None):
         """
+        ✅ FIXED: Proper residual structure
+        
         Args:
             x: (T, B, C, H, W) - input spikes
             hook: Optional monitoring dict
@@ -638,10 +611,10 @@ class MS_Block_Conv_MoE(nn.Module):
             attn: Attention features (for visualization)
             hook: Updated monitoring dict
         """
-        # Attention branch (includes internal residual)
+        # Attention branch (includes internal residual: x + Attn(x))
         x_attn, attn, hook = self.attn(x, hook=hook)
         
-        # MoE branch (includes internal residual)
+        # MoE branch (includes residual: x_attn + MoE(x_attn))
         x_mlp, hook = self.mlp(x_attn, hook=hook)
         
         return x_mlp, attn, hook
@@ -661,10 +634,11 @@ def create_spikeformer_moe_block(
     num_experts=8,
     tau_min=1.5,
     tau_max=4.0,
+    chunk_size=2,
     verbose=True
 ):
     """
-    Convenience function to create a standard MoE block
+    Convenience function to create a standard MoE block with proper residuals
     
     Example usage:
         block = create_spikeformer_moe_block(dim=64, num_experts=8)
@@ -679,8 +653,7 @@ def create_spikeformer_moe_block(
         drop_path=0.1,
         spike_mode="lif",
         dvs=False,
-        attention_mode="SDT",
-        chunk_size=2,
+        chunk_size=chunk_size,
         num_experts=num_experts,
         expert_top_k=2,
         aux_loss_weight=0.01,
@@ -693,12 +666,17 @@ def create_spikeformer_moe_block(
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Temporal MoE - Minimal Clean Version")
-    print("=" * 60)
+    print("=" * 70)
+    print("Temporal MoE - FIXED RESIDUAL CONNECTIONS")
+    print("=" * 70)
     
     # Create block
-    block = create_spikeformer_moe_block(dim=64, num_experts=8, verbose=True)
+    block = create_spikeformer_moe_block(
+        dim=64, 
+        num_experts=8, 
+        chunk_size=2,
+        verbose=True
+    )
     
     # Test forward pass
     x = torch.randn(4, 8, 64, 7, 7)  # (T, B, C, H, W)
@@ -706,9 +684,14 @@ if __name__ == "__main__":
     
     output, attn, hook = block(x)
     print(f"✅ Output shape: {output.shape}")
+    print(f"✅ Attention features shape: {attn.shape}")
     
     aux_loss = block.get_aux_loss()
     print(f"✅ Auxiliary loss: {aux_loss.item():.6f}")
     
-    print("\n✅ Forward pass successful!")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("✅ CRITICAL FIX APPLIED:")
+    print("   - Expert: Returns F(x), not F(x) + x")
+    print("   - MoE: Returns x + MoE(x), not x + (MoE(x) + x)")
+    print("   - No more double residual connections!")
+    print("=" * 70)
