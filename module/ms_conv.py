@@ -129,10 +129,10 @@ class MS_MLP_Expert(nn.Module):
         x = self.fc2_conv(x.flatten(0, 1))
         x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
         x = x + identity
-        print(f"[Expert called] tokens = {x.shape[1]}")
+        
         return x
 
-# Spike router input (T,B,C,H,W), output: top_k_weights, top_k_indices, router_logits(used for load balancing loss)
+
 class SpikeRouter(nn.Module):
     """Spike-based router for expert selection"""
     def __init__(
@@ -286,7 +286,6 @@ class MS_MoE_Conv(nn.Module):
             output: Mixed expert outputs (T, B, C, H, W)
             hook: Updated hook dictionary
         """
-
         T, B, C, H, W = x.shape
         identity = x
         
