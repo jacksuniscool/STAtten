@@ -1,4 +1,4 @@
-from .ms_conv import MS_Block_Conv_AutoMoE as MS_Block_Conv
+from .ms_conv import MS_Block_Conv
 from .sps import MS_SPS
 
 
