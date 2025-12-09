@@ -82,7 +82,6 @@ class MS_MLP_Expert(nn.Module):
         hidden_features=None,
         out_features=None,
         spike_mode="lif",
-        tau=2.0,
     ):
         super().__init__()
         out_features = out_features or in_features
@@ -93,17 +92,17 @@ class MS_MLP_Expert(nn.Module):
         self.fc1_bn = nn.BatchNorm2d(hidden_features)
         
         if spike_mode == "lif":
-            self.fc1_lif = MultiStepLIFNode(tau=tau, detach_reset=True, backend="cupy")
+            self.fc1_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
         elif spike_mode == "plif":
-            self.fc1_lif = MultiStepParametricLIFNode(init_tau=tau, detach_reset=True, backend="cupy")
+            self.fc1_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
         
         self.fc2_conv = nn.Conv2d(hidden_features, out_features, kernel_size=1, stride=1)
         self.fc2_bn = nn.BatchNorm2d(out_features)
         
         if spike_mode == "lif":
-            self.fc2_lif = MultiStepLIFNode(tau=tau, detach_reset=True, backend="cupy")
+            self.fc2_lif = MultiStepLIFNode(tau=2.0, detach_reset=True, backend="cupy")
         elif spike_mode == "plif":
-            self.fc2_lif = MultiStepParametricLIFNode(init_tau=tau, detach_reset=True, backend="cupy")
+            self.fc2_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
         
         self.c_hidden = hidden_features
         self.c_output = out_features
@@ -229,19 +228,17 @@ class MS_MoE_Conv(nn.Module):
             top_k=top_k,
             spike_mode=spike_mode,
         )
-        tau_min=1.5
-        tau_max=4.0
+        
         # Create expert networks
         self.experts = nn.ModuleList([
             MS_MLP_Expert(
-        in_features=in_features,
-        hidden_features=hidden_features,
-        out_features=out_features,
-        spike_mode=spike_mode,
-        tau=tau_min + (tau_max - tau_min) * i / (num_experts - 1) if num_experts > 1 else tau_min,
-    )
-    for i in range(num_experts)
-])
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
+                spike_mode=spike_mode,
+            )
+            for _ in range(num_experts)
+        ])
         
         self.c_output = out_features
         self.load_balancing_loss = None
