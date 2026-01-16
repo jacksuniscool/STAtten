@@ -82,7 +82,7 @@ class MS_MLP_Expert(nn.Module):
         hidden_features=None,
         out_features=None,
         spike_mode="lif",
-        tau=2.0,
+        tau=2.0
     ):
         super().__init__()
         out_features = out_features or in_features
@@ -130,10 +130,10 @@ class MS_MLP_Expert(nn.Module):
         x = self.fc2_conv(x.flatten(0, 1))
         x = self.fc2_bn(x).reshape(T, B, C, H, W).contiguous()
         x = x + identity
-        print(f"[Expert called] tokens = {x.shape[1]}")
+        
         return x
 
-# Spike router input (T,B,C,H,W), output: top_k_weights, top_k_indices, router_logits(used for load balancing loss)
+
 class SpikeRouter(nn.Module):
     """Spike-based router for expert selection"""
     def __init__(
@@ -221,6 +221,9 @@ class MS_MoE_Conv(nn.Module):
         self.top_k = top_k
         self.layer = layer
         self.aux_loss_weight = aux_loss_weight
+
+        tau_min=1.9
+        tau_max=2.1
         
         # Create router
         self.router = SpikeRouter(
@@ -229,19 +232,18 @@ class MS_MoE_Conv(nn.Module):
             top_k=top_k,
             spike_mode=spike_mode,
         )
-        tau_min=1.5
-        tau_max=4.0
+        
         # Create expert networks
         self.experts = nn.ModuleList([
             MS_MLP_Expert(
-        in_features=in_features,
-        hidden_features=hidden_features,
-        out_features=out_features,
-        spike_mode=spike_mode,
-        tau=tau_min + (tau_max - tau_min) * i / (num_experts - 1) if num_experts > 1 else tau_min,
-    )
-    for i in range(num_experts)
-])
+                in_features=in_features,
+                hidden_features=hidden_features,
+                out_features=out_features,
+                spike_mode=spike_mode,
+                tau=tau_min + i * (tau_max - tau_min) / (num_experts - 1),
+            )
+            for i in range(num_experts) 
+        ])
         
         self.c_output = out_features
         self.load_balancing_loss = None
@@ -289,7 +291,6 @@ class MS_MoE_Conv(nn.Module):
             output: Mixed expert outputs (T, B, C, H, W)
             hook: Updated hook dictionary
         """
-
         T, B, C, H, W = x.shape
         identity = x
         
