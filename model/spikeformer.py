@@ -39,6 +39,11 @@ class SpikeDrivenTransformer(nn.Module):
         attention_mode="STAtten",
         pretrained=False,
         pretrained_cfg=None,
+        # MoE Specific Parameters
+        use_moe=True,        # Kept for compatibility
+        num_experts=8,       # Number of experts per block
+        expert_top_k=2,      # Top-k routing
+        aux_loss_weight=0.01 # Weight for load balancing loss
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -80,7 +85,12 @@ class SpikeDrivenTransformer(nn.Module):
                     dvs=dvs_mode,
                     layer=j,
                     attention_mode=self.attention_mode,
-                    chunk_size=chunk_size
+                    chunk_size=chunk_size,
+                    # Pass MoE params down to the block
+                    use_moe=use_moe,
+                    num_experts=num_experts,
+                    expert_top_k=expert_top_k,
+                    aux_loss_weight=aux_loss_weight,
                 )
                 for j in range(depths)
             ]
@@ -136,6 +146,26 @@ class SpikeDrivenTransformer(nn.Module):
         if not self.TET:
             x = x.mean(0)
         return x, hook
+
+    # Collect aux losses from all blocks
+    def get_aux_loss(self):
+        """
+        Iterate through all blocks and sum up the load balancing loss from MoE layers.
+        Used by train.py to add to the total loss.
+        """
+        total_aux_loss = 0.0
+        found = False
+        
+        # Access the blocks (setattr used 'block' name above)
+        if hasattr(self, 'block'):
+            for blk in self.block:
+                if hasattr(blk, 'get_aux_loss'):
+                    loss = blk.get_aux_loss()
+                    if loss is not None:
+                        total_aux_loss += loss
+                        found = True
+        
+        return total_aux_loss if found else None
 
 
 @register_model
