@@ -896,6 +896,16 @@ def train_one_epoch(
                 )
             else:
                 loss = loss_fn(output, target)
+               
+            aux_loss = None
+            if hasattr(model, 'get_aux_loss'):
+                aux_loss = model.get_aux_loss()
+            elif hasattr(model, 'module') and hasattr(model.module, 'get_aux_loss'):
+                aux_loss = model.module.get_aux_loss()
+            
+            if aux_loss is not None:
+                loss += aux_loss
+                
         sample_number += input.shape[0]
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
