@@ -136,7 +136,6 @@ class SpikeRouter(nn.Module):
 
 
 class MS_MoE_Conv(nn.Module):
-
     def __init__(
         self,
         in_features,
@@ -415,10 +414,6 @@ class MS_SSA_Conv(nn.Module):
 
 
 class MS_Block_Conv(nn.Module):
-    """
-    Unified Transformer Block (Forced MoE Mode)
-    Refactored to remove unused parameters logic while keeping signature compatibility.
-    """
     def __init__(
         self,
         dim,
