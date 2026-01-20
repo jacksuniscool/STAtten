@@ -136,9 +136,7 @@ class SpikeRouter(nn.Module):
 
 
 class MS_MoE_Conv(nn.Module):
-    """
-    Sparse Mixture of Experts for SNN - 🚀 VECTORIZED FAST VERSION 🚀
-    """
+
     def __init__(
         self,
         in_features,
