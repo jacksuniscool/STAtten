@@ -57,7 +57,7 @@ class MS_MLP_Expert(nn.Module):
 
     def reset(self):
         """Reset LIF neuron states"""
-        for m in self.modules():
+        for m in self.children():
             if hasattr(m, "reset"):
                 m.reset()
 
@@ -103,6 +103,10 @@ class SpikeRouter(nn.Module):
         elif spike_mode == "plif":
             self.router_lif = MultiStepParametricLIFNode(init_tau=2.0, detach_reset=True, backend="cupy")
     
+    def reset(self):
+        if hasattr(self.router_lif, 'reset'):
+            self.router_lif.reset()
+            
     def forward(self, x):
         """
         Returns:
@@ -200,6 +204,7 @@ class MS_MoE_Conv(nn.Module):
         identity = x
         
         # 1. Reset all experts
+        self.router.reset()
         for expert in self.experts:
             expert.reset()
         
@@ -299,8 +304,16 @@ class MS_SSA_Conv(nn.Module):
         self.mode = mode
         self.layer = layer
         self.chunk_size = chunk_size
-
+    
+    def reset(self):
+        for m in self.children():
+            if hasattr(m, "reset"):
+               m.reset()
+            
     def forward(self, x, hook=None):
+        
+        self.reset()
+        
         T, B, C, H, W = x.shape
         head_dim = C // self.num_heads
         identity = x
