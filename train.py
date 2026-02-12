@@ -827,7 +827,6 @@ def main():
     if best_metric is not None:
         _logger.info("*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch))
 
-
 def train_one_epoch(
     epoch,
     model,
@@ -860,7 +859,7 @@ def train_one_epoch(
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
     
-    # [Modify 1] 新增一个 Meter 来记录 Expert 利用率
+    # 记录平均利用率（仅作概览）
     expert_utils_m = AverageMeter()
 
     model.train()
@@ -891,15 +890,12 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        # [Modify 2] 创建一个空字典，用于接收模型回传的利用率数据
+        # 接收 Hook 数据
         hook_dict = {}
 
         with amp_autocast():
-            # 传入 hook=hook_dict。注意：这要求你的 Top-Level Model (create_model 返回的对象) 
-            # 的 forward 函数必须能接收 **kwargs 或明确的 hook 参数，并将其传递给下层 layer。
             output_tuple = model(input, hook=hook_dict)
             
-            # 兼容处理：如果模型返回的是 tuple (output, hook)，取第一个；如果只返回 output，则直接赋值
             if isinstance(output_tuple, (tuple, list)):
                 output = output_tuple[0]
             else:
@@ -952,21 +948,21 @@ def train_one_epoch(
             model_ema.update(model)
             functional.reset_net(model_ema)
 
-        # [Modify 3] 提取并统计本 Batch 所有层 Expert 的平均利用率
-        batch_layer_utils = []
+        # 统计平均值用于 Meter (防止报错，先 .mean())
+        batch_layer_avgs = []
         for key, val in hook_dict.items():
             if 'expert_util' in key:
-                # 确保转为 python float
-                batch_layer_utils.append(val.item())
+                batch_layer_avgs.append(val.float().mean().item())
         
-        if len(batch_layer_utils) > 0:
-            # 计算所有层利用率的平均值
-            avg_util = sum(batch_layer_utils) / len(batch_layer_utils)
+        if len(batch_layer_avgs) > 0:
+            avg_util = sum(batch_layer_avgs) / len(batch_layer_avgs)
             expert_utils_m.update(avg_util, input.size(0))
 
         torch.cuda.synchronize()
         num_updates += 1
         batch_time_m.update(time.time() - end)
+        
+        # === 日志打印部分 ===
         if last_batch or batch_idx % args.log_interval == 0:
             lrl = [param_group["lr"] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
@@ -976,28 +972,34 @@ def train_one_epoch(
                 losses_m.update(reduced_loss.item(), input.size(0))
 
             if args.local_rank == 0:
-                 # [Modify 4] 修改日志格式，增加 Expert Util 的显示
                 _logger.info(
                     "Train: {} [{:>4d}/{} ({:>3.0f}%)]  "
                     "Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  "
-                    "Expert: {expert.val:>6.2f}% ({expert.avg:>6.2f}%) " 
-                    "Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  "
-                    "({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  "
-                    "LR: {lr:.3e}  "
-                    "Data: {data_time.val:.3f} ({data_time.avg:.3f})".format(
+                    "AvgUtil: {expert.val:>6.2f}%  " 
+                    "Time: {batch_time.val:.3f}s  "
+                    "LR: {lr:.3e}".format(
                         epoch,
                         batch_idx,
                         len(loader),
                         100.0 * batch_idx / last_idx,
                         loss=losses_m,
-                        expert=expert_utils_m, # 传入新的 meter
+                        expert=expert_utils_m, 
                         batch_time=batch_time_m,
-                        rate=input.size(0) * args.world_size / batch_time_m.val,
-                        rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
                         lr=lr,
-                        data_time=data_time_m,
                     )
                 )
+                
+                # [新增] 详细打印每个 Expert 的负载情况
+                _logger.info("--- Expert Load Balance Detail (Batch %d) ---" % batch_idx)
+                # 按层名字排序打印
+                for key in sorted(hook_dict.keys()):
+                    if 'expert_util' in key:
+                        val = hook_dict[key]
+                        # 格式化打印：保留1位小数
+                        util_list = val.float().tolist()
+                        util_str = ", ".join([f"{u:.1f}" for u in util_list])
+                        _logger.info(f"{key}: [{util_str}]")
+                _logger.info("---------------------------------------------")
 
                 if args.save_images and output_dir:
                     torchvision.utils.save_image(
@@ -1018,7 +1020,6 @@ def train_one_epoch(
             lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
 
         end = time.time()
-        # end for
 
     if hasattr(optimizer, "sync_lookahead"):
         optimizer.sync_lookahead()
