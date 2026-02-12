@@ -188,6 +188,11 @@ class SpikeRouter(nn.Module):
             * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., None, :]
         )
         
+        #expert usage tracking
+        usage_count = (mask_1 + mask_2).sum(dim=(0, 1))
+        total_tokens = T * B * N
+        utilization_pct = (usage_count / total_tokens) * 100
+        self.last_utilization = utilization_pct
         dispatch_tensor = combine_tensor.bool().to(combine_tensor)
         
         return dispatch_tensor, combine_tensor, loss, expert_capacity
@@ -455,8 +460,6 @@ class MS_Block_Conv(nn.Module):
         chunk_size=2,
         num_experts=8,
         aux_loss_weight=0.01,
-        use_moe=True,
-        expert_top_k=2,
     ):
         super().__init__()
         self.attn = MS_SSA_Conv(
@@ -482,6 +485,9 @@ class MS_Block_Conv(nn.Module):
             layer=layer,
             aux_loss_weight=aux_loss_weight,
         )
+    def reset(self):
+        self.attn.reset()
+        self.mlp.reset()
 
     def forward(self, x, hook=None):
         x_attn, attn, hook = self.attn(x, hook=hook)
