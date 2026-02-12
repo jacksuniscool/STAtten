@@ -859,6 +859,7 @@ def train_one_epoch(
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
+    expert_utils_m = AverageMeter()
 
     model.train()
     functional.reset_net(model)
@@ -888,15 +889,23 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
+        hook_dict = {}
+
         with amp_autocast():
-            output = model(input)[0]
+            output_tuple = model(input, hook=hook_dict)
+            
+            if isinstance(output_tuple, (tuple, list)):
+                output = output_tuple[0]
+            else:
+                output = output_tuple
+
             if args.TET:
                 loss = TET_loss(
                     output, target, loss_fn, means=args.TET_means, lamb=args.TET_lamb
                 )
             else:
                 loss = loss_fn(output, target)
-               
+                
             aux_loss = None
             if hasattr(model, 'get_aux_loss'):
                 aux_loss = model.get_aux_loss()
@@ -923,7 +932,6 @@ def train_one_epoch(
                 create_graph=second_order,
             )
         else:
-            # loss.backward()
             loss.backward(create_graph=second_order)
             if args.clip_grad is not None:
                 dispatch_clip_grad(
@@ -937,6 +945,15 @@ def train_one_epoch(
         if model_ema is not None:
             model_ema.update(model)
             functional.reset_net(model_ema)
+        
+        batch_layer_utils = []
+        for key, val in hook_dict.items():
+            if 'expert_util' in key:
+                batch_layer_utils.append(val.item())
+        
+        if len(batch_layer_utils) > 0:
+            avg_util = sum(batch_layer_utils) / len(batch_layer_utils)
+            expert_utils_m.update(avg_util, input.size(0))
 
         torch.cuda.synchronize()
         num_updates += 1
@@ -953,6 +970,7 @@ def train_one_epoch(
                 _logger.info(
                     "Train: {} [{:>4d}/{} ({:>3.0f}%)]  "
                     "Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  "
+                    "Expert: {expert.val:>6.2f}% ({expert.avg:>6.2f}%) " 
                     "Time: {batch_time.val:.3f}s, {rate:>7.2f}/s  "
                     "({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)  "
                     "LR: {lr:.3e}  "
@@ -962,6 +980,7 @@ def train_one_epoch(
                         len(loader),
                         100.0 * batch_idx / last_idx,
                         loss=losses_m,
+                        expert=expert_utils_m, # 传入新的 meter
                         batch_time=batch_time_m,
                         rate=input.size(0) * args.world_size / batch_time_m.val,
                         rate_avg=input.size(0) * args.world_size / batch_time_m.avg,
