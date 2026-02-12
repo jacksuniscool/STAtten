@@ -859,6 +859,8 @@ def train_one_epoch(
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
+    
+    # [Modify 1] 新增一个 Meter 来记录 Expert 利用率
     expert_utils_m = AverageMeter()
 
     model.train()
@@ -889,11 +891,15 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
+        # [Modify 2] 创建一个空字典，用于接收模型回传的利用率数据
         hook_dict = {}
 
         with amp_autocast():
+            # 传入 hook=hook_dict。注意：这要求你的 Top-Level Model (create_model 返回的对象) 
+            # 的 forward 函数必须能接收 **kwargs 或明确的 hook 参数，并将其传递给下层 layer。
             output_tuple = model(input, hook=hook_dict)
             
+            # 兼容处理：如果模型返回的是 tuple (output, hook)，取第一个；如果只返回 output，则直接赋值
             if isinstance(output_tuple, (tuple, list)):
                 output = output_tuple[0]
             else:
@@ -945,13 +951,16 @@ def train_one_epoch(
         if model_ema is not None:
             model_ema.update(model)
             functional.reset_net(model_ema)
-        
+
+        # [Modify 3] 提取并统计本 Batch 所有层 Expert 的平均利用率
         batch_layer_utils = []
         for key, val in hook_dict.items():
             if 'expert_util' in key:
+                # 确保转为 python float
                 batch_layer_utils.append(val.item())
         
         if len(batch_layer_utils) > 0:
+            # 计算所有层利用率的平均值
             avg_util = sum(batch_layer_utils) / len(batch_layer_utils)
             expert_utils_m.update(avg_util, input.size(0))
 
@@ -967,6 +976,7 @@ def train_one_epoch(
                 losses_m.update(reduced_loss.item(), input.size(0))
 
             if args.local_rank == 0:
+                 # [Modify 4] 修改日志格式，增加 Expert Util 的显示
                 _logger.info(
                     "Train: {} [{:>4d}/{} ({:>3.0f}%)]  "
                     "Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  "
