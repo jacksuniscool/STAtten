@@ -462,6 +462,8 @@ class MS_Block_Conv(nn.Module):
         chunk_size=2,
         num_experts=8,
         aux_loss_weight=0.01,
+        use_moe=True,         
+        **kwargs              
     ):
         super().__init__()
         self.attn = MS_SSA_Conv(
