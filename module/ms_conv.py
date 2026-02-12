@@ -210,6 +210,8 @@ class MS_MoE_Conv(nn.Module):
         aux_loss_weight=0.01,
         capacity_factor_train=1.25,
         capacity_factor_eval=2.0,
+        use_moe=True,   
+        **kwargs
     ):
         super().__init__()
         out_features = out_features or in_features
