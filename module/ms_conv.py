@@ -253,6 +253,9 @@ class MS_MoE_Conv(nn.Module):
         dispatch_tensor, combine_tensor, loss, expert_capacity = self.router(x)
         self.load_balancing_loss = loss
         
+        if hook is not None:
+            hook[f'layer_{self.layer}_expert_util'] = self.router.last_utilization.detach().cpu()
+
         x_flat = x.permute(0, 1, 3, 4, 2).reshape(T * B, N, C)
         
         expert_inputs = torch.einsum('bnd,bnec->ebcd', x_flat, dispatch_tensor)
