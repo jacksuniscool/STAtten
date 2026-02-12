@@ -827,6 +827,7 @@ def main():
     if best_metric is not None:
         _logger.info("*** Best metric: {0} (epoch {1})".format(best_metric, best_epoch))
 
+
 def train_one_epoch(
     epoch,
     model,
@@ -859,7 +860,7 @@ def train_one_epoch(
     data_time_m = AverageMeter()
     losses_m = AverageMeter()
     
-    # 记录平均利用率（仅作概览）
+    # [Modify 1] 新增一个 Meter 来记录 Expert 利用率
     expert_utils_m = AverageMeter()
 
     model.train()
@@ -890,12 +891,14 @@ def train_one_epoch(
         if args.channels_last:
             input = input.contiguous(memory_format=torch.channels_last)
 
-        # 接收 Hook 数据
+        # [Modify 2] 创建一个空字典，用于接收模型回传的利用率数据
         hook_dict = {}
 
         with amp_autocast():
+            # 传入 hook=hook_dict
             output_tuple = model(input, hook=hook_dict)
             
+            # 兼容处理
             if isinstance(output_tuple, (tuple, list)):
                 output = output_tuple[0]
             else:
@@ -948,14 +951,15 @@ def train_one_epoch(
             model_ema.update(model)
             functional.reset_net(model_ema)
 
-        # 统计平均值用于 Meter (防止报错，先 .mean())
-        batch_layer_avgs = []
+        # [Modify 3] 提取数据 (已修复 ValError 和 Variable Name Error)
+        batch_layer_utils = []
         for key, val in hook_dict.items():
             if 'expert_util' in key:
-                batch_layer_avgs.append(val.float().mean().item())
+                # 修复点：val 是向量，取平均值转为标量
+                batch_layer_utils.append(val.float().mean().item())
         
-        if len(batch_layer_avgs) > 0:
-            avg_util = sum(batch_layer_avgs) / len(batch_layer_avgs)
+        if len(batch_layer_utils) > 0:
+            avg_util = sum(batch_layer_utils) / len(batch_layer_utils)
             expert_utils_m.update(avg_util, input.size(0))
 
         torch.cuda.synchronize()
@@ -972,6 +976,7 @@ def train_one_epoch(
                 losses_m.update(reduced_loss.item(), input.size(0))
 
             if args.local_rank == 0:
+                # [Modify 4] 日志打印
                 _logger.info(
                     "Train: {} [{:>4d}/{} ({:>3.0f}%)]  "
                     "Loss: {loss.val:>9.6f} ({loss.avg:>6.4f})  "
@@ -991,7 +996,6 @@ def train_one_epoch(
                 
                 # [新增] 详细打印每个 Expert 的负载情况
                 _logger.info("--- Expert Load Balance Detail (Batch %d) ---" % batch_idx)
-                # 按层名字排序打印
                 for key in sorted(hook_dict.keys()):
                     if 'expert_util' in key:
                         val = hook_dict[key]
