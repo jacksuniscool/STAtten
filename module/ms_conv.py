@@ -93,7 +93,7 @@ class SpikeRouter(nn.Module):
         num_experts,
         spike_mode="lif",
         eps=1e-9,
-        capacity_factor_train=2.0,
+        capacity_factor_train=1.25,
         capacity_factor_eval=2.0,
     ):
         super().__init__()
@@ -116,7 +116,6 @@ class SpikeRouter(nn.Module):
             self.router_lif.reset()
     
     def forward(self, x):
-
         T, B, C, H, W = x.shape
         N = H * W  
         
@@ -124,33 +123,22 @@ class SpikeRouter(nn.Module):
             capacity_factor = self.capacity_factor_train
         else:
             capacity_factor = self.capacity_factor_eval
-        
+            
         router_out = self.router_lif(x)
         router_out = self.router_conv(router_out.flatten(0, 1))  
         router_out = self.router_bn(router_out)
         
-     
         raw_gates = router_out.permute(0, 2, 3, 1).reshape(T * B, N, self.num_experts)
         raw_gates = raw_gates.softmax(dim=-1)
         
         num_gates = self.num_experts
         group_size = N  
-        
 
-        gate_1, index_1 = top1(raw_gates)
+        gate_1, index_1 = top1(raw_gates) # gate_1: [T*B, N], index_1: [T*B, N]
         mask_1 = F.one_hot(index_1, num_gates).float()
-        density_1_proxy = raw_gates
         
-        gates_without_top_1 = raw_gates * (1. - mask_1)
-        gate_2, index_2 = top1(gates_without_top_1)
-        mask_2 = F.one_hot(index_2, num_gates).float()
-        
-        denom = gate_1 + gate_2 + self.eps
-        gate_1 = gate_1 / denom
-        gate_2 = gate_2 / denom
-        
+        density_1_proxy = raw_gates.mean(dim=-2) 
         density_1 = mask_1.mean(dim=-2)
-        density_1_proxy = density_1_proxy.mean(dim=-2)
         loss = (density_1_proxy * density_1).mean() * float(num_gates ** 2)
         
         expert_capacity = min(group_size, int((group_size * capacity_factor) / num_gates))
@@ -158,41 +146,25 @@ class SpikeRouter(nn.Module):
         expert_capacity_f = float(expert_capacity)
         
         position_in_expert_1 = cumsum_exclusive(mask_1, dim=-2) * mask_1
-       
+        
         mask_1 = mask_1 * (position_in_expert_1 < expert_capacity_f).float()
-        
-        mask_1_count = mask_1.sum(dim=-2, keepdim=True)
-        
         mask_1_flat = mask_1.sum(dim=-1)
         position_in_expert_1 = position_in_expert_1.sum(dim=-1)
-        gate_1 = gate_1 * mask_1_flat
-        
 
-        position_in_expert_2 = cumsum_exclusive(mask_2, dim=-2) + mask_1_count
-        position_in_expert_2 = position_in_expert_2 * mask_2
-        mask_2 = mask_2 * (position_in_expert_2 < expert_capacity_f).float()
-        mask_2_flat = mask_2.sum(dim=-1)
-        position_in_expert_2 = position_in_expert_2.sum(dim=-1)
-        gate_2 = gate_2 * mask_2_flat
-        
-        # combine_tensor shape: [T*B, N, num_experts, expert_capacity]
+        gate_1 = gate_1 * mask_1_flat
+
         combine_tensor = (
             gate_1[..., None, None]
             * mask_1_flat[..., None, None]
             * F.one_hot(index_1, num_gates)[..., None]
             * safe_one_hot(position_in_expert_1.long(), expert_capacity)[..., None, :]
-            +
-            gate_2[..., None, None]
-            * mask_2_flat[..., None, None]
-            * F.one_hot(index_2, num_gates)[..., None]
-            * safe_one_hot(position_in_expert_2.long(), expert_capacity)[..., None, :]
         )
         
-        #expert usage tracking
-        usage_count = (mask_1 + mask_2).sum(dim=(0, 1))
+        usage_count = mask_1.sum(dim=(0, 1))
         total_tokens = T * B * N
         utilization_pct = (usage_count / total_tokens) * 100
         self.last_utilization = utilization_pct
+        
         dispatch_tensor = combine_tensor.bool().to(combine_tensor)
         
         return dispatch_tensor, combine_tensor, loss, expert_capacity
