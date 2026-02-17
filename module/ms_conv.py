@@ -93,7 +93,7 @@ class SpikeRouter(nn.Module):
         num_experts,
         spike_mode="lif",
         eps=1e-9,
-        capacity_factor_train=1.5,
+        capacity_factor_train=2.0,
         capacity_factor_eval=2.0,
     ):
         super().__init__()
@@ -463,7 +463,7 @@ class MS_Block_Conv(nn.Module):
         layer=0,
         attention_mode="STAtten",
         chunk_size=2,
-        num_experts=8,
+        num_experts=4,
         aux_loss_weight=0.01,
         use_moe=True,         
         **kwargs              
