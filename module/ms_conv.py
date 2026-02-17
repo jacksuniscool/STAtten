@@ -93,7 +93,7 @@ class SpikeRouter(nn.Module):
         num_experts,
         spike_mode="lif",
         eps=1e-9,
-        capacity_factor_train=1.25,
+        capacity_factor_train=1.5,
         capacity_factor_eval=2.0,
     ):
         super().__init__()
@@ -204,7 +204,7 @@ class MS_MoE_Conv(nn.Module):
         in_features,
         hidden_features=None,
         out_features=None,
-        num_experts=8,
+        num_experts=4,
         spike_mode="lif",
         layer=0,
         aux_loss_weight=0.01,
