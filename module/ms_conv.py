@@ -208,7 +208,7 @@ class MS_MoE_Conv(nn.Module):
         spike_mode="lif",
         layer=0,
         aux_loss_weight=0.01,
-        capacity_factor_train=1.25,
+        capacity_factor_train=2.0,
         capacity_factor_eval=2.0,
         use_moe=True,   
         **kwargs
